@@ -13,11 +13,19 @@ def clean_text(text):
     return ""
 
 def get_float(s):
-    """Intenta convertir a float, retorna 0.0 si falla."""
+    """
+    Intenta convertir a float limpiando símbolos de moneda.
+    Ej: "USD 1,500.00" -> 1500.0
+    """
     if s is None: return 0.0
     try:
-        val_str = str(s).replace(',', '').strip()
-        return float(val_str)
+        # Quitamos caracteres no numéricos comunes excepto punto y coma
+        # Mantenemos dígitos, puntos, comas y signos menos
+        s_clean = re.sub(r'[^\d.,-]', '', str(s))
+        if not s_clean: return 0.0
+        # Asumimos formato estándar: eliminar comas de miles
+        s_clean = s_clean.replace(',', '')
+        return float(s_clean)
     except ValueError:
         return 0.0
 
@@ -45,9 +53,30 @@ def parse_month(text):
         return f"0{text}"
     return text if text.isdigit() else None
 
+def find_text_in_area(sheet, start_row, start_col, rows_down=20, cols_right=3):
+    """
+    Busca el primer texto no vacío en un rectángulo debajo/derecha de la etiqueta.
+    Ideal para Observaciones desplazadas.
+    """
+    for r in range(start_row + 1, start_row + rows_down + 1):
+        # Barrer horizontalmente desde la columna de la etiqueta hacia la derecha
+        for c in range(start_col, start_col + cols_right + 1):
+            try:
+                cell = sheet.cell(row=r, column=c)
+                val = cell.value
+                val_clean = clean_text(val)
+                if val_clean:
+                    # Filtros para no agarrar basura del pie de página
+                    if "TOTAL" in val_clean or "FIRMA" in val_clean or "PAGE" in val_clean:
+                        continue
+                    return val # Devolver el valor original (con formato si lo tiene)
+            except:
+                continue
+    return None
+
 def scan_sheet_for_specific_values(sheet):
     """
-    Busca valores específicos (Moneda, Incoterm, Condición Específica) escaneando toda la hoja.
+    Busca valores específicos (Moneda, Incoterm) y FRASES CLAVE DE RESCATE.
     """
     detected = {
         'Moneda': None,
@@ -58,10 +87,10 @@ def scan_sheet_for_specific_values(sheet):
     currency_map = {'DÓLAR': 'USD', 'DOLAR': 'USD', 'USD': 'USD', 'EURO': 'EUR', 'EUR': 'EUR'}
     incoterm_list = ['FOB', 'CIF', 'CFR', 'EXW', 'FCA', 'DDP', 'DAP', 'CPT', 'CIP']
     
-    # Frases específicas que el usuario quiere rescatar si existen
-    condicion_keywords = ['BAJO CONDICION', 'UNDER CONDITION', 'A CONSIGNACION']
+    # Palabras clave de "Rescate" para condición de venta
+    rescue_phrases = ['BAJO CONDICION', 'BAJO CONDICIÓN', 'UNDER CONDITION', 'A CONSIGNACION', 'LIBRE CONSIGNACION']
 
-    for row in sheet.iter_rows(min_row=1, max_row=100):
+    for row in sheet.iter_rows(min_row=1, max_row=150):
         for cell in row:
             val = clean_text(cell.value)
             if not val: continue
@@ -73,52 +102,46 @@ def scan_sheet_for_specific_values(sheet):
                         detected['Moneda'] = v
                         break
             
-            # 2. Incoterm (Código puro)
+            # 2. Incoterm (Código puro - 3 letras)
             if not detected['Incoterm']:
                 for inc in incoterm_list:
+                    # Regex para palabra exacta
                     if re.search(rf"\b{inc}\b", val):
                         detected['Incoterm'] = inc
                         break
-
-            # 3. Rescate de Condición ("Bajo Condición")
+            
+            # 3. Rescate de Condición Específica
             if not detected['Condicion_Rescate']:
-                for ck in condicion_keywords:
-                    if ck in val:
-                        detected['Condicion_Rescate'] = val # Guardamos la frase completa encontrada
+                for phrase in rescue_phrases:
+                    if phrase in val:
+                        detected['Condicion_Rescate'] = cell.value # Guardar valor original
                         break
                         
     return detected
 
 def get_data_near_label(sheet, start_row, start_col, search_directions=['below', 'right'], max_steps=10):
-    """
-    Busca dato no vacío cerca de una coordenada.
-    """
     for direction in search_directions:
         for step in range(1, max_steps + 1):
-            target_row = start_row
-            target_col = start_col
-            
-            if direction == 'below':
-                target_row += step
-            elif direction == 'right':
-                target_col += step
+            target_row, target_col = start_row, start_col
+            if direction == 'below': target_row += step
+            elif direction == 'right': target_col += step
             
             try:
                 cell = sheet.cell(row=target_row, column=target_col)
                 val = cell.value
                 val_clean = clean_text(val)
-                # Si encontramos un valor que NO es una etiqueta común, lo devolvemos
-                if val is not None and val_clean != "":
-                    # Pequeño filtro para no devolver otra etiqueta como dato
-                    if "CLIENTE" not in val_clean and "FECHA" not in val_clean:
-                        return val
+                if val_clean:
+                    # Evitar devolver otra etiqueta como dato
+                    if "CLIENTE" in val_clean or "FECHA" in val_clean: continue
+                    return val
             except:
                 pass
     return None
 
 def find_coords(sheet, keywords, exact_match=False):
-    """Devuelve (row, col) de la primera coincidencia de keyword."""
-    for row in sheet.iter_rows(min_row=1, max_row=150, max_col=50): # Aumenté a 150 filas para buscar obs abajo
+    """Devuelve (row, col) de la primera coincidencia."""
+    # Ampliado el rango de búsqueda vertical
+    for row in sheet.iter_rows(min_row=1, max_row=150, max_col=50): 
         for cell in row:
             val = clean_text(cell.value)
             if not val: continue
@@ -176,12 +199,15 @@ def process_file(uploaded_file):
         else:
             header_data['Fecha'] = None
 
-    # --- OBSERVACIONES (Lógica Mejorada) ---
-    # Buscamos la etiqueta y permitimos un salto grande hacia abajo (20 celdas)
-    obs_keywords = ['OBSERVACIONES', 'REMARKS', 'NOTAS', 'GLOSA', 'COMENTARIOS', 'SPECIAL INSTRUCTIONS']
+    # --- OBSERVACIONES (Lógica V9: Búsqueda en Área) ---
+    obs_keywords = ['OBSERVACIONES', 'REMARKS', 'NOTAS', 'GLOSA', 'COMENTARIOS']
     coord = find_coords(sheet, obs_keywords)
-    # Aumentamos max_steps a 20 porque a veces hay mucho espacio en blanco antes del texto
-    header_data['Observaciones'] = get_data_near_label(sheet, coord[0], coord[1], ['below', 'right'], max_steps=20) if coord else None
+    if coord:
+        # Usamos la nueva función find_text_in_area que barre un rectángulo
+        # Esto encuentra el texto aunque esté desplazado a la derecha o muy abajo
+        header_data['Observaciones'] = find_text_in_area(sheet, coord[0], coord[1], rows_down=25, cols_right=5)
+    else:
+        header_data['Observaciones'] = None
 
     # PUERTOS
     coord = find_coords(sheet, ['PUERTO DE EMBARQUE', 'LOADING PORT', 'POL'])
@@ -190,23 +216,25 @@ def process_file(uploaded_file):
     coord = find_coords(sheet, ['PUERTO DESTINO', 'DISCHARGING PORT', 'DESTINATION', 'POD'])
     header_data['Puerto_Dest'] = get_data_near_label(sheet, coord[0], coord[1], ['below', 'right']) if coord else None
 
-    # --- CONDICION DE VENTA y FORMA DE PAGO ---
-    coord = find_coords(sheet, ['CONDICION DE VENTA', 'TERMS OF SALE', 'DELIVERY TERMS', 'INCOTERM'])
-    header_data['Condicion_Venta'] = get_data_near_label(sheet, coord[0], coord[1], ['below', 'right']) if coord else None
-
+    # FORMA DE PAGO
     coord = find_coords(sheet, ['PAYMENT TERMS', 'FORMA DE PAGO'])
     header_data['Forma_Pago'] = get_data_near_label(sheet, coord[0], coord[1], ['below', 'right']) if coord else None
 
-    # --- ESCANEO DE RESCATE (Búsqueda global) ---
+    # --- ESCANEO DE RESCATE (Prioridad Máxima para Condición) ---
     scanned = scan_sheet_for_specific_values(sheet)
     header_data['Moneda'] = scanned['Moneda']
     header_data['Incoterm'] = scanned['Incoterm'] 
     
-    # Si la búsqueda por etiqueta falló para "Bajo Condición", usamos lo encontrado en el escaneo
-    if not header_data['Condicion_Venta'] and scanned['Condicion_Rescate']:
+    # Lógica de Condición de Venta:
+    # 1. Si el escáner encontró "BAJO CONDICION", esa es la verdad absoluta.
+    if scanned['Condicion_Rescate']:
         header_data['Condicion_Venta'] = scanned['Condicion_Rescate']
+    else:
+        # 2. Si no, busca por etiqueta tradicional
+        coord = find_coords(sheet, ['CONDICION DE VENTA', 'TERMS OF SALE', 'DELIVERY TERMS'])
+        header_data['Condicion_Venta'] = get_data_near_label(sheet, coord[0], coord[1], ['below', 'right']) if coord else None
 
-    # --- EXTRACCIÓN DE PRODUCTOS (Filtro Precio > 0) ---
+    # --- EXTRACCIÓN DE PRODUCTOS ---
     products = []
     col_map = {}
     header_row = None
@@ -230,7 +258,6 @@ def process_file(uploaded_file):
                 if any(k in val for k in desc_keywords): col_map['Descripcion'] = cell.column
                 elif any(k in val for k in qty_keywords): col_map['Cantidad'] = cell.column
                 elif any(k in val for k in price_keywords): col_map['Precio Unitario'] = cell.column
-                # Evitar que 'TOTAL FOB' se confunda con la columna de totales de línea
                 elif any(k in val for k in total_keywords) and 'TOTAL CASES' not in val and 'TOTAL FOB' not in val and 'TOTAL CIF' not in val: 
                     col_map['Total Linea'] = cell.column
             break
@@ -254,12 +281,14 @@ def process_file(uploaded_file):
             price_num = get_float(price)
             total_num = get_float(total)
 
-            # FILTRO ESTRICTO: Precio Unitario debe ser > 0 para ser un producto válido
-            is_valid_product = (price_num > 0)
+            # FILTRO ESTRICTO V9: 
+            # 1. Precio debe ser > 0
+            # 2. Descripción no debe estar vacía
+            is_valid_product = (price_num > 0) and (desc_clean != "")
             
             if not desc_clean:
                 empty_streak += 1
-                if empty_streak > 15: break
+                if empty_streak > 20: break
             else:
                 empty_streak = 0
                 if is_valid_product:
@@ -284,9 +313,9 @@ def process_file(uploaded_file):
     return final_rows, None
 
 # --- UI ---
-st.set_page_config(page_title="Extractor V8", layout="wide")
-st.title("📄 Extractor de Facturas V8 (Rescate de Datos)")
-st.info("Versión con búsqueda profunda para Observaciones y rescate de 'Bajo Condición'.")
+st.set_page_config(page_title="Extractor V9", layout="wide")
+st.title("📄 Extractor de Facturas V9 (Deep Search)")
+st.info("Mejoras: Búsqueda de área para Observaciones y captura forzada de 'Bajo Condición'.")
 
 uploaded_files = st.file_uploader("Archivos Excel", type=['xlsx'], accept_multiple_files=True)
 
@@ -314,4 +343,4 @@ if uploaded_files and st.button("Procesar"):
         with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
             df.to_excel(writer, index=False)
             
-        st.download_button("Descargar Excel Unificado", buffer.getvalue(), "facturas_procesadas_v8.xlsx")
+        st.download_button("Descargar Excel Unificado", buffer.getvalue(), "facturas_procesadas_v9.xlsx")
