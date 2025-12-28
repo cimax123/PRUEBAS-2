@@ -12,14 +12,17 @@ def clean_text(text):
         return str(text).strip().upper()
     return ""
 
-def is_number(s):
-    """Verifica si un valor puede interpretarse como número."""
-    if s is None: return False
+def get_float(s):
+    """Intenta convertir a float, retorna 0.0 si falla."""
+    if s is None: return 0.0
     try:
-        float(str(s).replace(',', '').strip())
-        return True
+        # Limpiar caracteres no numéricos excepto punto y coma
+        # Asumiendo formato decimal con punto o coma, esto puede requerir ajuste según región
+        # Aquí intentamos simple: quitar comas de miles y parsear
+        val_str = str(s).replace(',', '').strip()
+        return float(val_str)
     except ValueError:
-        return False
+        return 0.0
 
 def parse_month(text):
     """Convierte meses en texto (ES/EN) a número."""
@@ -55,7 +58,8 @@ def scan_sheet_for_specific_values(sheet):
     }
     
     currency_map = {'DÓLAR': 'USD', 'DOLAR': 'USD', 'USD': 'USD', 'EURO': 'EUR', 'EUR': 'EUR'}
-    incoterm_list = ['FOB', 'CIF', 'CFR', 'EXW', 'FCA', 'DDP', 'DAP']
+    # Incoterms de 3 letras
+    incoterm_list = ['FOB', 'CIF', 'CFR', 'EXW', 'FCA', 'DDP', 'DAP', 'CPT', 'CIP']
 
     for row in sheet.iter_rows(min_row=1, max_row=100):
         for cell in row:
@@ -72,14 +76,17 @@ def scan_sheet_for_specific_values(sheet):
             # 2. Incoterm (Código puro)
             if not detected['Incoterm']:
                 for inc in incoterm_list:
-                    # Buscamos coincidencias exactas del código incoterm
+                    # Buscamos palabra exacta "FOB" o "TOTAL FOB"
                     if re.search(rf"\b{inc}\b", val):
                         detected['Incoterm'] = inc
                         break
     return detected
 
-def get_data_near_label(sheet, start_row, start_col, search_directions=['below', 'right'], max_steps=5):
-    """Busca dato no vacío cerca de una coordenada."""
+def get_data_near_label(sheet, start_row, start_col, search_directions=['below', 'right'], max_steps=10):
+    """
+    Busca dato no vacío cerca de una coordenada.
+    Aumentado max_steps a 10 para saltar columnas vacías ocultas.
+    """
     for direction in search_directions:
         for step in range(1, max_steps + 1):
             target_row = start_row
@@ -93,7 +100,9 @@ def get_data_near_label(sheet, start_row, start_col, search_directions=['below',
             try:
                 cell = sheet.cell(row=target_row, column=target_col)
                 val = cell.value
-                if val is not None and str(val).strip() != "":
+                val_clean = clean_text(val)
+                # Ignorar si encontramos otra etiqueta conocida (ej: encontrar 'FECHA' buscando 'CLIENTE')
+                if val is not None and val_clean != "":
                     return val
             except:
                 pass
@@ -132,7 +141,7 @@ def process_file(uploaded_file):
     coord = find_coords(sheet, ['CLIENTE', 'CUSTOMER', 'CONSIGNEE', 'SOLD TO'])
     header_data['Cliente'] = get_data_near_label(sheet, coord[0], coord[1], ['below', 'right']) if coord else None
     
-    # -- EXP --
+    # -- EXP (Búsqueda estricta) --
     coord = find_coords(sheet, ['EXP', 'INVOICE NO', 'FACTURA N'], exact_match=True)
     header_data['Num_Exp'] = get_data_near_label(sheet, coord[0], coord[1], ['below', 'right']) if coord else None
 
@@ -160,21 +169,24 @@ def process_file(uploaded_file):
             header_data['Fecha'] = None
 
     # -- OBSERVACIONES --
-    coord = find_coords(sheet, ['OBSERVACIONES', 'REMARKS', 'NOTAS', 'GLOSA'])
-    header_data['Observaciones'] = get_data_near_label(sheet, coord[0], coord[1], ['below', 'right']) if coord else None
+    # Ampliamos keywords y aumentamos radio de búsqueda
+    obs_keywords = ['OBSERVACIONES', 'REMARKS', 'NOTAS', 'GLOSA', 'COMENTARIOS', 'SPECIAL INSTRUCTIONS']
+    coord = find_coords(sheet, obs_keywords)
+    header_data['Observaciones'] = get_data_near_label(sheet, coord[0], coord[1], ['below', 'right'], max_steps=6) if coord else None
 
     # -- PUERTOS --
-    coord = find_coords(sheet, ['PUERTO DE EMBARQUE', 'LOADING PORT'])
+    coord = find_coords(sheet, ['PUERTO DE EMBARQUE', 'LOADING PORT', 'POL'])
     header_data['Puerto_Emb'] = get_data_near_label(sheet, coord[0], coord[1], ['below', 'right']) if coord else None
     
-    coord = find_coords(sheet, ['PUERTO DESTINO', 'DISCHARGING PORT', 'DESTINATION'])
+    coord = find_coords(sheet, ['PUERTO DESTINO', 'DISCHARGING PORT', 'DESTINATION', 'POD'])
     header_data['Puerto_Dest'] = get_data_near_label(sheet, coord[0], coord[1], ['below', 'right']) if coord else None
 
-    # -- CONDICION DE VENTA (Corrección: NO incluir Formas de Pago) --
-    coord = find_coords(sheet, ['CONDICION DE VENTA', 'TERMS OF SALE', 'DELIVERY TERMS'])
+    # -- CONDICION DE VENTA (Texto descriptivo) --
+    # Buscamos "CONDICION DE VENTA" pero NO "FORMA DE PAGO"
+    coord = find_coords(sheet, ['CONDICION DE VENTA', 'TERMS OF SALE', 'DELIVERY TERMS', 'INCOTERM'])
     header_data['Condicion_Venta'] = get_data_near_label(sheet, coord[0], coord[1], ['below', 'right']) if coord else None
 
-    # -- FORMA DE PAGO (Nuevo campo separado) --
+    # -- FORMA DE PAGO --
     coord = find_coords(sheet, ['PAYMENT TERMS', 'FORMA DE PAGO'])
     header_data['Forma_Pago'] = get_data_near_label(sheet, coord[0], coord[1], ['below', 'right']) if coord else None
 
@@ -183,7 +195,7 @@ def process_file(uploaded_file):
     header_data['Moneda'] = scanned['Moneda']
     header_data['Incoterm'] = scanned['Incoterm'] 
 
-    # 3. Extracción de Productos (Tabla Estricta)
+    # 3. Extracción de Productos (Lógica "Solo Precios Reales")
     products = []
     
     col_map = {}
@@ -208,7 +220,8 @@ def process_file(uploaded_file):
                 if any(k in val for k in desc_keywords): col_map['Descripcion'] = cell.column
                 elif any(k in val for k in qty_keywords): col_map['Cantidad'] = cell.column
                 elif any(k in val for k in price_keywords): col_map['Precio Unitario'] = cell.column
-                elif any(k in val for k in total_keywords) and 'TOTAL CASES' not in val: col_map['Total Linea'] = cell.column
+                elif any(k in val for k in total_keywords) and 'TOTAL CASES' not in val and 'TOTAL FOB' not in val: 
+                    col_map['Total Linea'] = cell.column
             break
             
     if header_row and 'Descripcion' in col_map:
@@ -218,8 +231,9 @@ def process_file(uploaded_file):
             desc_val = sheet.cell(row=curr, column=col_map['Descripcion']).value
             desc_clean = clean_text(desc_val)
             
-            # Criterio de parada: Fila de totales
-            if "TOTAL" in desc_clean and "CAJAS" not in desc_clean and "CASES" not in desc_clean:
+            # Criterio de parada: Totales explícitos en descripción
+            if desc_clean.startswith("TOTAL") or " TOTAL" in desc_clean:
+                # Ojo: A veces "TOTAL CASES" aparece. Cortamos aquí.
                 break
             
             # Extracción
@@ -227,20 +241,27 @@ def process_file(uploaded_file):
             price = sheet.cell(row=curr, column=col_map['Precio Unitario']).value if 'Precio Unitario' in col_map else None
             total = sheet.cell(row=curr, column=col_map['Total Linea']).value if 'Total Linea' in col_map else None
             
-            # VALIDACIÓN CRÍTICA: La fila debe tener datos numéricos en Cantidad o Precio
-            has_valid_numbers = (qty and is_number(qty)) or (price and is_number(price)) or (total and is_number(total))
+            # CONVERSIÓN A NÚMEROS (Crucial para filtrar basura)
+            qty_num = get_float(qty)
+            price_num = get_float(price)
+            total_num = get_float(total)
+
+            # FILTRO ESTRICTO:
+            # Una fila es válida SOLO si tiene PRECIO > 0.
+            # (Muchas veces hay filas con cantidades totales de cajas pero sin precio, o textos largos).
+            is_valid_product = (price_num > 0)
             
             if not desc_clean:
                 empty_streak += 1
-                if empty_streak > 8: break 
+                if empty_streak > 15: break # Margen amplio por si hay saltos de página
             else:
                 empty_streak = 0
-                if has_valid_numbers:
+                if is_valid_product:
                     prod = {
                         'Descripcion': desc_val,
-                        'Cantidad': qty,
-                        'Precio Unitario': price,
-                        'Total Linea': total
+                        'Cantidad': qty_num,
+                        'Precio Unitario': price_num,
+                        'Total Linea': total_num if total_num > 0 else (qty_num * price_num)
                     }
                     products.append(prod)
                 
@@ -258,9 +279,9 @@ def process_file(uploaded_file):
     return final_rows, None
 
 # --- UI ---
-st.set_page_config(page_title="Extractor V6", layout="wide")
-st.title("📄 Extractor de Facturas V6 (Separación de Pagos)")
-st.info("Corrección: 'Forma de Pago' ahora es una columna separada de 'Condición de Venta'.")
+st.set_page_config(page_title="Extractor V7", layout="wide")
+st.title("📄 Extractor de Facturas V7 (Validación de Precios)")
+st.info("Ahora filtra estrictamente filas que no tengan un precio unitario > 0 para evitar filas fantasma.")
 
 uploaded_files = st.file_uploader("Archivos Excel", type=['xlsx'], accept_multiple_files=True)
 
@@ -274,7 +295,6 @@ if uploaded_files and st.button("Procesar"):
     if all_data:
         df = pd.DataFrame(all_data)
         
-        # Nueva columna 'Forma_Pago' añadida al orden
         cols = ['Archivo', 'Cliente', 'Num_Exp', 'Fecha', 'Condicion_Venta', 'Incoterm', 'Forma_Pago', 'Moneda', 
                 'Puerto_Emb', 'Puerto_Dest', 'Cantidad', 'Descripcion', 
                 'Precio Unitario', 'Total Linea', 'Observaciones']
@@ -289,4 +309,4 @@ if uploaded_files and st.button("Procesar"):
         with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
             df.to_excel(writer, index=False)
             
-        st.download_button("Descargar Excel Unificado", buffer.getvalue(), "facturas_procesadas_v6.xlsx")
+        st.download_button("Descargar Excel Unificado", buffer.getvalue(), "facturas_procesadas_v7.xlsx")
