@@ -12,6 +12,15 @@ def clean_text(text):
         return str(text).strip().upper()
     return ""
 
+def is_number(s):
+    """Verifica si un valor puede interpretarse como número."""
+    if s is None: return False
+    try:
+        float(str(s).replace(',', '').strip())
+        return True
+    except ValueError:
+        return False
+
 def parse_month(text):
     """Convierte meses en texto (ES/EN) a número."""
     text = clean_text(text)
@@ -61,11 +70,9 @@ def scan_sheet_for_specific_values(sheet):
                         break
             
             # 2. Incoterm (Código puro)
-            # Evitamos confundir con FLETE o CONDICION DE VENTA
             if not detected['Incoterm']:
                 for inc in incoterm_list:
-                    # Buscamos "TOTAL FOB", "CIF VALUE", o celda exacta "FOB"
-                    # Usamos regex para asegurar que es palabra completa
+                    # Buscamos coincidencias exactas del código incoterm
                     if re.search(rf"\b{inc}\b", val):
                         detected['Incoterm'] = inc
                         break
@@ -93,10 +100,7 @@ def get_data_near_label(sheet, start_row, start_col, search_directions=['below',
     return None
 
 def find_coords(sheet, keywords, exact_match=False):
-    """
-    Devuelve (row, col) de la primera coincidencia de keyword.
-    exact_match: Si es True, busca coincidencia exacta o palabra aislada (crucial para 'EXP').
-    """
+    """Devuelve (row, col) de la primera coincidencia de keyword."""
     for row in sheet.iter_rows(min_row=1, max_row=100, max_col=50):
         for cell in row:
             val = clean_text(cell.value)
@@ -104,8 +108,6 @@ def find_coords(sheet, keywords, exact_match=False):
             
             for k in keywords:
                 if exact_match:
-                    # Busca la palabra exacta o rodeada de bordes (evita encontrar EXP en EXPORTACION)
-                    # Escapamos k por si tiene caracteres especiales
                     if k == val or re.search(rf"\b{re.escape(k)}\b", val):
                         return cell.row, cell.column
                 else:
@@ -130,7 +132,7 @@ def process_file(uploaded_file):
     coord = find_coords(sheet, ['CLIENTE', 'CUSTOMER', 'CONSIGNEE', 'SOLD TO'])
     header_data['Cliente'] = get_data_near_label(sheet, coord[0], coord[1], ['below', 'right']) if coord else None
     
-    # -- EXP (Estricto para no confundir con EXPORTACION) --
+    # -- EXP --
     coord = find_coords(sheet, ['EXP', 'INVOICE NO', 'FACTURA N'], exact_match=True)
     header_data['Num_Exp'] = get_data_near_label(sheet, coord[0], coord[1], ['below', 'right']) if coord else None
 
@@ -157,7 +159,7 @@ def process_file(uploaded_file):
         else:
             header_data['Fecha'] = None
 
-    # -- OBSERVACIONES (Sin MARCAS para evitar CYL) --
+    # -- OBSERVACIONES --
     coord = find_coords(sheet, ['OBSERVACIONES', 'REMARKS', 'NOTAS', 'GLOSA'])
     header_data['Observaciones'] = get_data_near_label(sheet, coord[0], coord[1], ['below', 'right']) if coord else None
 
@@ -168,10 +170,13 @@ def process_file(uploaded_file):
     coord = find_coords(sheet, ['PUERTO DESTINO', 'DISCHARGING PORT', 'DESTINATION'])
     header_data['Puerto_Dest'] = get_data_near_label(sheet, coord[0], coord[1], ['below', 'right']) if coord else None
 
-    # -- CONDICION DE VENTA (Texto libre) --
-    # Esto capturará "TO BE COLLECT..." o lo que aparezca bajo la etiqueta
-    coord = find_coords(sheet, ['CONDICION DE VENTA', 'TERMS OF SALE', 'PAYMENT TERMS', 'DELIVERY TERMS'])
+    # -- CONDICION DE VENTA (Corrección: NO incluir Formas de Pago) --
+    coord = find_coords(sheet, ['CONDICION DE VENTA', 'TERMS OF SALE', 'DELIVERY TERMS'])
     header_data['Condicion_Venta'] = get_data_near_label(sheet, coord[0], coord[1], ['below', 'right']) if coord else None
+
+    # -- FORMA DE PAGO (Nuevo campo separado) --
+    coord = find_coords(sheet, ['PAYMENT TERMS', 'FORMA DE PAGO'])
+    header_data['Forma_Pago'] = get_data_near_label(sheet, coord[0], coord[1], ['below', 'right']) if coord else None
 
     # 2. Escaneo Directo (Moneda e Incoterm Código)
     scanned = scan_sheet_for_specific_values(sheet)
@@ -192,7 +197,6 @@ def process_file(uploaded_file):
     # Buscar cabecera de tabla
     for row in sheet.iter_rows(min_row=1, max_row=100):
         row_txt = [clean_text(c.value) for c in row]
-        # Debe tener descripcion Y (cantidad O precio) en la misma fila para ser cabecera
         has_desc = any(any(k in txt for k in desc_keywords) for txt in row_txt if txt)
         has_qty = any(any(k in txt for k in qty_keywords) for txt in row_txt if txt)
         
@@ -214,7 +218,7 @@ def process_file(uploaded_file):
             desc_val = sheet.cell(row=curr, column=col_map['Descripcion']).value
             desc_clean = clean_text(desc_val)
             
-            # Criterios de parada
+            # Criterio de parada: Fila de totales
             if "TOTAL" in desc_clean and "CAJAS" not in desc_clean and "CASES" not in desc_clean:
                 break
             
@@ -223,17 +227,15 @@ def process_file(uploaded_file):
             price = sheet.cell(row=curr, column=col_map['Precio Unitario']).value if 'Precio Unitario' in col_map else None
             total = sheet.cell(row=curr, column=col_map['Total Linea']).value if 'Total Linea' in col_map else None
             
-            # VALIDACIÓN ESTRICTA DE FILA:
-            # Una fila es válida solo si tiene (Cantidad OR Precio OR Total) Y Descripción
-            has_numbers = (qty is not None) or (price is not None) or (total is not None)
+            # VALIDACIÓN CRÍTICA: La fila debe tener datos numéricos en Cantidad o Precio
+            has_valid_numbers = (qty and is_number(qty)) or (price and is_number(price)) or (total and is_number(total))
             
             if not desc_clean:
                 empty_streak += 1
-                if empty_streak > 8: break # Aumenté margen por si hay espacios grandes
+                if empty_streak > 8: break 
             else:
                 empty_streak = 0
-                # Solo agregamos si parece un producto real
-                if has_numbers:
+                if has_valid_numbers:
                     prod = {
                         'Descripcion': desc_val,
                         'Cantidad': qty,
@@ -241,10 +243,7 @@ def process_file(uploaded_file):
                         'Total Linea': total
                     }
                     products.append(prod)
-                else:
-                    # Si tiene descripción pero no números, podría ser una línea de continuación de descripción
-                    # Opcional: concatenar a la anterior. Por ahora lo ignoramos para evitar filas basura.
-                    pass
+                
             curr += 1
 
     # 4. Unificación
@@ -253,13 +252,15 @@ def process_file(uploaded_file):
         for p in products:
             final_rows.append({'Archivo': uploaded_file.name, **header_data, **p})
     else:
+        # Si no detectó productos válidos, devolvemos solo la cabecera
         final_rows.append({'Archivo': uploaded_file.name, **header_data})
         
     return final_rows, None
 
 # --- UI ---
-st.set_page_config(page_title="Extractor V4", layout="wide")
-st.title("📄 Extractor de Facturas V4 (Refinado)")
+st.set_page_config(page_title="Extractor V6", layout="wide")
+st.title("📄 Extractor de Facturas V6 (Separación de Pagos)")
+st.info("Corrección: 'Forma de Pago' ahora es una columna separada de 'Condición de Venta'.")
 
 uploaded_files = st.file_uploader("Archivos Excel", type=['xlsx'], accept_multiple_files=True)
 
@@ -273,12 +274,11 @@ if uploaded_files and st.button("Procesar"):
     if all_data:
         df = pd.DataFrame(all_data)
         
-        # Orden de columnas preferido
-        cols = ['Archivo', 'Cliente', 'Num_Exp', 'Fecha', 'Condicion_Venta', 'Incoterm', 'Moneda', 
+        # Nueva columna 'Forma_Pago' añadida al orden
+        cols = ['Archivo', 'Cliente', 'Num_Exp', 'Fecha', 'Condicion_Venta', 'Incoterm', 'Forma_Pago', 'Moneda', 
                 'Puerto_Emb', 'Puerto_Dest', 'Cantidad', 'Descripcion', 
                 'Precio Unitario', 'Total Linea', 'Observaciones']
         
-        # Filtrar columnas que existen y añadir las faltantes
         existing_cols = [c for c in cols if c in df.columns]
         remaining_cols = [c for c in df.columns if c not in existing_cols]
         df = df[existing_cols + remaining_cols]
@@ -289,4 +289,4 @@ if uploaded_files and st.button("Procesar"):
         with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
             df.to_excel(writer, index=False)
             
-        st.download_button("Descargar Excel Unificado", buffer.getvalue(), "facturas_procesadas.xlsx")
+        st.download_button("Descargar Excel Unificado", buffer.getvalue(), "facturas_procesadas_v6.xlsx")
