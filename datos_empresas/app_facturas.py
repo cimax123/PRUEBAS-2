@@ -3,11 +3,23 @@ import pandas as pd
 import openpyxl
 import io
 import re
+import unicodedata
 
 # --- Funciones de Limpieza y Utilidad ---
 
+def normalize_text(text):
+    """
+    Elimina acentos y normaliza a mayúsculas para comparaciones robustas.
+    Ej: "Condición" -> "CONDICION"
+    """
+    if not text: return ""
+    text = str(text).upper().strip()
+    # Eliminar acentos
+    text = ''.join(c for c in unicodedata.normalize('NFD', text) if unicodedata.category(c) != 'Mn')
+    return text
+
 def clean_text(text):
-    """Normaliza texto: mayúsculas y strip."""
+    """Limpieza básica manteniendo acentos para visualización."""
     if text:
         return str(text).strip().upper()
     return ""
@@ -25,7 +37,7 @@ def get_float(s):
 
 def parse_month(text):
     """Convierte meses texto a número."""
-    text = clean_text(text)
+    text = normalize_text(text)
     months = {
         'ENERO': '01', 'JANUARY': '01', 'JAN': '01',
         'FEBRERO': '02', 'FEBRUARY': '02', 'FEB': '02',
@@ -49,26 +61,22 @@ def parse_month(text):
 
 def find_label_cell(sheet, keywords):
     """
-    Busca la coordenada de una etiqueta en la hoja.
-    Retorna (row, col) de la primera coincidencia.
+    Busca la coordenada de una etiqueta en la hoja usando texto normalizado (sin acentos).
     """
-    # Limitamos búsqueda a primeras 150 filas para cabeceras/footers
+    keywords_norm = [normalize_text(k) for k in keywords]
+    
     for row in sheet.iter_rows(min_row=1, max_row=150, max_col=50):
         for cell in row:
-            val = clean_text(cell.value)
+            val = normalize_text(cell.value)
             if not val: continue
             
-            for k in keywords:
-                # Búsqueda flexible: la celda contiene la keyword
+            for k in keywords_norm:
                 if k in val:
                     return cell.row, cell.column
     return None
 
 def extract_value_near_label(sheet, label_row, label_col, look_down=True, look_right=True, max_steps=10):
-    """
-    Dada la posición de una etiqueta, busca el valor asociado saltando vacíos.
-    Prioriza búsqueda según argumentos.
-    """
+    """Busca el valor asociado saltando vacíos."""
     directions = []
     if look_down: directions.append('below')
     if look_right: directions.append('right')
@@ -82,52 +90,74 @@ def extract_value_near_label(sheet, label_row, label_col, look_down=True, look_r
             try:
                 cell = sheet.cell(row=r, column=c)
                 val = cell.value
-                val_clean = clean_text(val)
-                
-                if val_clean:
-                    # Evitar tomar otra etiqueta como valor (ej: encontrar "FECHA:" buscando "CLIENTE:")
-                    # Si el valor termina en dos puntos o parece una etiqueta común, ignorar o detener
-                    # Heurística simple: Si contiene otra keyword estructural, saltar?
-                    # Por ahora, asumimos que es el dato.
-                    return val
+                val_norm = normalize_text(val)
+                if val_norm:
+                    # Filtro: Si parece otra etiqueta, ignorar
+                    if "CLIENTE" in val_norm or "FECHA" in val_norm: continue
+                    return val # Devolvemos valor original (con formato)
             except:
                 pass
     return None
 
-def extract_multiline_text(sheet, start_row, col, max_lines=6):
-    """
-    Concatena texto de varias filas consecutivas (para Observaciones largas).
-    Se detiene si encuentra una celda vacía o una nueva etiqueta evidente.
-    """
-    lines = []
-    empty_count = 0
+def scan_headers_footers(sheet):
+    """Busca texto en las propiedades de impresión (Header/Footer)."""
+    texts = []
+    props = [
+        sheet.oddHeader.left, sheet.oddHeader.center, sheet.oddHeader.right,
+        sheet.oddFooter.left, sheet.oddFooter.center, sheet.oddFooter.right,
+        sheet.evenHeader.left, sheet.evenHeader.center, sheet.evenHeader.right,
+        sheet.evenFooter.left, sheet.evenFooter.center, sheet.evenFooter.right,
+        sheet.firstHeader.left, sheet.firstHeader.center, sheet.firstHeader.right,
+        sheet.firstFooter.left, sheet.firstFooter.center, sheet.firstFooter.right,
+    ]
+    for p in props:
+        if p.text: texts.append(p.text)
+    return " | ".join(texts) if texts else None
+
+def find_longest_text_in_footer(sheet, start_row, min_length=20):
+    """Fuerza Bruta para encontrar textos largos al final."""
+    longest_text = None
+    max_len = 0
     
-    for r in range(start_row, start_row + max_lines):
-        try:
-            # Ampliamos un poco el ancho (col y col+1) por si está combinado o desplazado
-            # Priorizamos la columna alineada, luego la siguiente
-            val = sheet.cell(row=r, column=col).value
-            if not val:
-                 val = sheet.cell(row=r, column=col+1).value # Intento columna vecina derecha
-            
-            val_clean = clean_text(val)
-            
-            if not val_clean:
-                empty_count += 1
-                if empty_count >= 2: break # 2 líneas vacías = fin del bloque
+    for r in range(start_row, min(start_row + 50, sheet.max_row + 1)):
+        for c in range(1, 25): 
+            try:
+                cell = sheet.cell(row=r, column=c)
+                val = str(cell.value).strip() if cell.value else ""
+                val_norm = normalize_text(val)
+                
+                # Ignorar basura común
+                if any(x in val_norm for x in ["TOTAL", "PAGE", "FIRMA", "SIGNATURE", "GRACIAS", "PAGINA"]):
+                    continue
+                
+                if len(val) > min_length and len(val) > max_len:
+                    max_len = len(val)
+                    longest_text = val
+            except:
                 continue
-            else:
-                empty_count = 0
-                
-            # Filtro de parada: Si parece un footer o nueva sección
-            if any(x in val_clean for x in ["TOTAL", "PAGE", "FIRMA", "SIGNATURE", "GRACIAS"]):
-                break
-                
-            lines.append(str(val).strip())
-        except:
-            continue
-            
-    return " ".join(lines) if lines else None
+    return longest_text
+
+# --- Debug Helper ---
+def get_all_sheet_text(sheet):
+    """Extrae todo el texto visible en celdas para diagnóstico."""
+    data = []
+    # Revisar celdas normales
+    for r in range(1, min(sheet.max_row + 1, 200)):
+        for c in range(1, min(sheet.max_column + 1, 30)):
+            cell = sheet.cell(row=r, column=c)
+            if cell.value:
+                data.append({
+                    "Ubicación": f"Fila {r}, Col {c}",
+                    "Tipo": "Celda",
+                    "Valor": str(cell.value)
+                })
+    
+    # Revisar Headers/Footers
+    hf_text = scan_headers_footers(sheet)
+    if hf_text:
+        data.append({"Ubicación": "Header/Footer", "Tipo": "Impresión", "Valor": hf_text})
+        
+    return pd.DataFrame(data)
 
 # --- Procesamiento de Archivo ---
 
@@ -136,26 +166,25 @@ def process_file(uploaded_file):
         wb = openpyxl.load_workbook(uploaded_file, data_only=True)
         sheet = wb.active
     except Exception as e:
-        return [], f"Error leyendo Excel: {str(e)}"
+        return [], f"Error leyendo Excel: {str(e)}", None, False
 
     header_data = {}
+    
+    # Detección de posibles cuadros de texto (Drawings)
+    has_drawings = hasattr(sheet, 'drawings') and len(sheet.drawings) > 0
+    
+    # Generar datos de diagnóstico
+    debug_df = get_all_sheet_text(sheet)
 
     # 1. CLIENTE
     lbl_coords = find_label_cell(sheet, ['CLIENTE', 'CUSTOMER', 'CONSIGNEE', 'SOLD TO'])
-    if lbl_coords:
-        header_data['Cliente'] = extract_value_near_label(sheet, lbl_coords[0], lbl_coords[1])
-    else:
-        header_data['Cliente'] = None
+    header_data['Cliente'] = extract_value_near_label(sheet, lbl_coords[0], lbl_coords[1]) if lbl_coords else None
 
-    # 2. EXP / FACTURA
-    lbl_coords = find_label_cell(sheet, ['EXP', 'INVOICE NO', 'FACTURA N']) # Keywords
-    if lbl_coords:
-        header_data['Num_Exp'] = extract_value_near_label(sheet, lbl_coords[0], lbl_coords[1])
-    else:
-        header_data['Num_Exp'] = None
+    # 2. EXP
+    lbl_coords = find_label_cell(sheet, ['EXP', 'INVOICE NO', 'FACTURA N'])
+    header_data['Num_Exp'] = extract_value_near_label(sheet, lbl_coords[0], lbl_coords[1]) if lbl_coords else None
 
-    # 3. FECHA (Buscamos componentes o fecha completa)
-    # Intento 1: Año/Mes/Dia separados
+    # 3. FECHA
     cy = find_label_cell(sheet, ['AÑO', 'YEAR'])
     cm = find_label_cell(sheet, ['MES', 'MONTH'])
     cd = find_label_cell(sheet, ['DIA', 'DAY'])
@@ -165,10 +194,9 @@ def process_file(uploaded_file):
     val_d = extract_value_near_label(sheet, cd[0], cd[1]) if cd else None
     
     if val_y and val_m and val_d:
-        m_num = parse_month(val_m)
+        m_num = parse_month(str(val_m))
         header_data['Fecha'] = f"{val_d}/{m_num}/{val_y}"
     else:
-        # Intento 2: Etiqueta "FECHA" única
         c_date = find_label_cell(sheet, ['FECHA', 'DATE'])
         if c_date:
             raw_date = extract_value_near_label(sheet, c_date[0], c_date[1])
@@ -179,21 +207,29 @@ def process_file(uploaded_file):
         else:
             header_data['Fecha'] = None
 
-    # 4. CONDICIÓN DE VENTA (Texto libre bajo etiqueta)
-    # Busca la etiqueta y toma lo que haya. No busca palabras específicas.
+    # 4. CONDICIÓN DE VENTA
+    # Buscar por etiqueta normalizada
     lbl_coords = find_label_cell(sheet, ['CONDICION DE VENTA', 'TERMS OF SALE', 'DELIVERY TERMS', 'INCOTERM'])
     if lbl_coords:
-        # Priorizamos mirar ABAJO para textos largos, luego a la DERECHA
         header_data['Condicion_Venta'] = extract_value_near_label(sheet, lbl_coords[0], lbl_coords[1], look_down=True, look_right=True)
     else:
-        header_data['Condicion_Venta'] = None
+        # Intento de rescate V13: Buscar en Headers/Footers si no se encontró
+        hf = scan_headers_footers(sheet)
+        if hf and "CONDICION" in normalize_text(hf):
+            header_data['Condicion_Venta'] = hf # Fallback crudo
+        else:
+            # Rescate ciego: Buscar celda que contenga "BAJO CONDICION"
+            for idx, row in debug_df.iterrows():
+                txt = normalize_text(row['Valor'])
+                if "BAJO CONDICION" in txt or "UNDER CONDITION" in txt:
+                    header_data['Condicion_Venta'] = row['Valor']
+                    break
+            else:
+                header_data['Condicion_Venta'] = None
 
     # 5. FORMA DE PAGO
     lbl_coords = find_label_cell(sheet, ['FORMA DE PAGO', 'PAYMENT TERMS'])
-    if lbl_coords:
-        header_data['Forma_Pago'] = extract_value_near_label(sheet, lbl_coords[0], lbl_coords[1])
-    else:
-        header_data['Forma_Pago'] = None
+    header_data['Forma_Pago'] = extract_value_near_label(sheet, lbl_coords[0], lbl_coords[1]) if lbl_coords else None
 
     # 6. PUERTOS
     c_emb = find_label_cell(sheet, ['PUERTO DE EMBARQUE', 'LOADING PORT', 'POL'])
@@ -202,24 +238,20 @@ def process_file(uploaded_file):
     c_dest = find_label_cell(sheet, ['PUERTO DESTINO', 'DISCHARGING PORT', 'DESTINATION', 'POD'])
     header_data['Puerto_Dest'] = extract_value_near_label(sheet, c_dest[0], c_dest[1]) if c_dest else None
 
-    # 7. MONEDA e INCOTERM (Códigos)
-    # Estos sí son estandarizados (USD, FOB), así que los escaneamos globalmente por seguridad
+    # 7. MONEDA e INCOTERM (Global scan)
     detected_codes = {'Moneda': None, 'Incoterm': None}
-    incoterm_list = ['FOB', 'CIF', 'CFR', 'EXW', 'FCA', 'DDP', 'DAP']
+    incoterm_list = ['FOB', 'CIF', 'CFR', 'EXW', 'FCA']
     currency_map = {'DÓLAR': 'USD', 'DOLAR': 'USD', 'USD': 'USD', 'EURO': 'EUR'}
     
-    for row in sheet.iter_rows(min_row=1, max_row=100):
-        for cell in row:
-            v = clean_text(cell.value)
-            if not v: continue
-            
-            if not detected_codes['Incoterm']:
-                for inc in incoterm_list:
-                    if re.search(rf"\b{inc}\b", v): detected_codes['Incoterm'] = inc
-            
-            if not detected_codes['Moneda']:
-                for cur, code in currency_map.items():
-                    if cur in v: detected_codes['Moneda'] = code
+    for idx, row in debug_df.iterrows():
+        v = normalize_text(row['Valor'])
+        if not detected_codes['Incoterm']:
+            for inc in incoterm_list:
+                # Palabra exacta
+                if re.search(rf"\b{inc}\b", v): detected_codes['Incoterm'] = inc
+        if not detected_codes['Moneda']:
+            for cur, code in currency_map.items():
+                if cur in v: detected_codes['Moneda'] = code
 
     header_data['Moneda'] = detected_codes['Moneda']
     header_data['Incoterm'] = detected_codes['Incoterm']
@@ -230,43 +262,42 @@ def process_file(uploaded_file):
     header_row = None
     last_row_table = 20
     
-    # Keywords de columnas
     kw_desc = ['DESCRIPCION', 'DESCRIPTION', 'MERCADERIA']
     kw_qty = ['CANTIDAD', 'QUANTITY', 'QTTY', 'PCS', 'BOXES']
     kw_price = ['PRECIO', 'PRICE', 'UNIT']
     kw_total = ['TOTAL']
 
-    # 1. Encontrar cabecera de tabla
-    for row in sheet.iter_rows(min_row=1, max_row=100):
-        row_txt = [clean_text(c.value) for c in row]
-        # Debe tener descripcion Y cantidad
+    # Buscar cabecera
+    for r in range(1, 100):
+        row_cells = []
+        for c in range(1, 30):
+            val = sheet.cell(row=r, column=c).value
+            row_cells.append((c, normalize_text(val)))
+        
+        row_txt = [x[1] for x in row_cells]
         if any(any(k in t for k in kw_desc) for t in row_txt) and any(any(k in t for k in kw_qty) for t in row_txt):
-            header_row = row[0].row
-            # Mapear columnas
-            for cell in row:
-                v = clean_text(cell.value)
+            header_row = r
+            for c, v in row_cells:
                 if not v: continue
-                if any(k in v for k in kw_desc): col_map['Descripcion'] = cell.column
-                elif any(k in v for k in kw_qty): col_map['Cantidad'] = cell.column
-                elif any(k in v for k in kw_price): col_map['Precio Unitario'] = cell.column
+                if any(k in v for k in kw_desc): col_map['Descripcion'] = c
+                elif any(k in v for k in kw_qty): col_map['Cantidad'] = c
+                elif any(k in v for k in kw_price): col_map['Precio Unitario'] = c
                 elif any(k in v for k in kw_total) and 'TOTAL CASES' not in v and 'FOB' not in v: 
-                    col_map['Total Linea'] = cell.column
+                    col_map['Total Linea'] = c
             break
 
-    # 2. Leer filas
     if header_row and 'Descripcion' in col_map:
         curr = header_row + 1
         empty_streak = 0
         while curr <= sheet.max_row:
             desc_val = sheet.cell(row=curr, column=col_map['Descripcion']).value
-            desc_clean = clean_text(desc_val)
+            desc_norm = normalize_text(desc_val)
             
-            # Si encontramos palabra TOTAL al inicio de la descripción, asumimos fin de tabla
-            if desc_clean.startswith("TOTAL") or " TOTAL" in desc_clean:
+            # Criterio de parada
+            if desc_norm.startswith("TOTAL"):
                 last_row_table = curr
                 break
             
-            # Datos
             qty = sheet.cell(row=curr, column=col_map['Cantidad']).value if 'Cantidad' in col_map else 0
             price = sheet.cell(row=curr, column=col_map['Precio Unitario']).value if 'Precio Unitario' in col_map else 0
             total = sheet.cell(row=curr, column=col_map['Total Linea']).value if 'Total Linea' in col_map else 0
@@ -275,8 +306,8 @@ def process_file(uploaded_file):
             p_num = get_float(price)
             t_num = get_float(total)
             
-            # Filtro: Debe tener precio > 0 y descripción para ser producto
-            if p_num > 0 and desc_clean:
+            # FILTRO ROBUSTO
+            if p_num > 0 and desc_norm and "TOTAL" not in desc_norm:
                 prod = {
                     'Descripcion': desc_val,
                     'Cantidad': q_num,
@@ -285,35 +316,36 @@ def process_file(uploaded_file):
                 }
                 products.append(prod)
                 empty_streak = 0
-                last_row_table = curr # Actualizamos última fila válida
+                last_row_table = curr 
             else:
-                if not desc_clean:
+                if not desc_norm:
                     empty_streak += 1
-                    if empty_streak > 15: # Fin de tabla por vacíos
+                    if empty_streak > 15:
                         last_row_table = curr - 15
                         break
             curr += 1
     else:
-        last_row_table = 20 # Fallback
+        last_row_table = 20
 
-    # --- OBSERVACIONES (Lógica Multilínea + Ubicación Dinámica) ---
-    # Buscamos la etiqueta 'OBSERVACIONES' en TODA la hoja, pero enfocándonos en el footer si es posible
-    # Si la encontramos, usamos extract_multiline_text para tomar todo el bloque
+    # --- OBSERVACIONES (Lógica V13) ---
+    obs_text = None
     
+    # 1. Intentar por etiqueta (Normalizada)
     obs_label_pos = find_label_cell(sheet, ['OBSERVACIONES', 'REMARKS', 'NOTAS', 'GLOSA', 'COMENTARIOS'])
-    
     if obs_label_pos:
-        r_obs, c_obs = obs_label_pos
-        # Intentamos obtener texto multilínea DEBAJO de la etiqueta
-        obs_text = extract_multiline_text(sheet, start_row=r_obs + 1, col=c_obs)
+        obs_text = extract_value_near_label(sheet, obs_label_pos[0], obs_label_pos[1], look_down=True, look_right=True)
+    
+    # 2. Si falló, fuerza bruta en el footer
+    if not obs_text:
+        obs_text = find_longest_text_in_footer(sheet, start_row=last_row_table + 1)
         
-        # Si no hubo nada abajo, miramos a la derecha (una sola celda o bloque)
-        if not obs_text:
-             obs_text = extract_value_near_label(sheet, r_obs, c_obs, look_down=False, look_right=True)
-             
-        header_data['Observaciones'] = obs_text
-    else:
-        header_data['Observaciones'] = None
+    # 3. Si falló, revisar Header/Footer de impresión
+    if not obs_text:
+        hf = scan_headers_footers(sheet)
+        if hf and len(hf) > 20: # Si hay texto largo en header/footer, podría ser la observación
+             obs_text = hf
+
+    header_data['Observaciones'] = obs_text
 
     # --- Unificación ---
     final_rows = []
@@ -323,39 +355,66 @@ def process_file(uploaded_file):
     else:
         final_rows.append({'Archivo': uploaded_file.name, **header_data})
         
-    return final_rows, None
+    return final_rows, None, debug_df, has_drawings
 
 # --- Interfaz Gráfica ---
 
-st.set_page_config(page_title="Extractor V11 Genérico", layout="wide")
-st.title("📄 Extractor de Facturas V11 (Estructural)")
-st.info("Búsqueda 100% basada en estructura: Etiquetas + Posición. Detecta observaciones multilínea y textos variables.")
+st.set_page_config(page_title="Extractor V13", layout="wide")
+st.title("📄 Extractor de Facturas V13 (Deep Scan)")
+st.markdown("""
+**Diagnóstico Avanzado:**
+* **Normalización:** Ignora mayúsculas/minúsculas y acentos (Condición = CONDICION).
+* **Scanner Oculto:** Busca en encabezados/pies de página de impresión.
+* **Alerta de Objetos:** Avisa si detecta "Text Boxes" invisibles.
+""")
 
 uploaded_files = st.file_uploader("Archivos Excel (.xlsx)", type=['xlsx'], accept_multiple_files=True)
 
-if uploaded_files and st.button("Procesar Archivos"):
-    all_data = []
-    for file in uploaded_files:
-        rows, err = process_file(file)
-        if rows: all_data.extend(rows)
-        if err: st.error(f"{file.name}: {err}")
+if uploaded_files:
+    if st.button("Procesar Archivos"):
+        all_data = []
+        debug_info = {}
+        drawings_alert = []
         
-    if all_data:
-        df = pd.DataFrame(all_data)
-        
-        # Ordenar columnas
-        cols_order = ['Archivo', 'Cliente', 'Num_Exp', 'Fecha', 'Condicion_Venta', 'Incoterm', 'Forma_Pago', 
-                      'Moneda', 'Puerto_Emb', 'Puerto_Dest', 'Cantidad', 'Descripcion', 
-                      'Precio Unitario', 'Total Linea', 'Observaciones']
-        
-        final_cols = [c for c in cols_order if c in df.columns] + [c for c in df.columns if c not in cols_order]
-        df = df[final_cols]
-        
-        st.success("Procesamiento completado.")
-        st.dataframe(df, use_container_width=True)
-        
-        buffer = io.BytesIO()
-        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-            df.to_excel(writer, index=False)
+        for file in uploaded_files:
+            rows, err, debug_df, has_drawings = process_file(file)
+            if has_drawings:
+                drawings_alert.append(file.name)
             
-        st.download_button("Descargar Excel", buffer.getvalue(), "facturas_v11.xlsx")
+            if rows: 
+                all_data.extend(rows)
+                debug_info[file.name] = debug_df
+            if err: st.error(f"{file.name}: {err}")
+        
+        # Alerta de Cuadros de Texto
+        if drawings_alert:
+            st.warning(f"⚠️ ¡ATENCIÓN! Se detectaron objetos flotantes (Imágenes/Cuadros de Texto) en: {', '.join(drawings_alert)}. "
+                       "Si faltan las Observaciones, es 99% seguro que están dentro de estos cuadros. "
+                       "Python no puede leer texto dentro de imágenes/formas fácilmente. "
+                       "**Solución:** Copia el texto del cuadro y pégalo en una celda vacía del Excel.")
+
+        tab1, tab2 = st.tabs(["📊 Resultados", "🔍 Diagnóstico Total"])
+        
+        with tab1:
+            if all_data:
+                df = pd.DataFrame(all_data)
+                cols_order = ['Archivo', 'Cliente', 'Num_Exp', 'Fecha', 'Condicion_Venta', 'Incoterm', 'Forma_Pago', 
+                              'Moneda', 'Puerto_Emb', 'Puerto_Dest', 'Cantidad', 'Descripcion', 
+                              'Precio Unitario', 'Total Linea', 'Observaciones']
+                final_cols = [c for c in cols_order if c in df.columns] + [c for c in df.columns if c not in cols_order]
+                df = df[final_cols]
+                
+                st.dataframe(df, use_container_width=True)
+                
+                buffer = io.BytesIO()
+                with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+                    df.to_excel(writer, index=False)
+                st.download_button("Descargar Excel", buffer.getvalue(), "facturas_v13.xlsx")
+            else:
+                st.warning("No se extrajeron datos.")
+
+        with tab2:
+            st.info("Este es el texto REAL que el robot puede ver en las celdas. Si tus datos no están aquí, están en cuadros de texto flotantes.")
+            for fname, d_df in debug_info.items():
+                with st.expander(f"Rayos X de: {fname}"):
+                    st.dataframe(d_df, use_container_width=True)
