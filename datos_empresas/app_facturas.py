@@ -8,150 +8,214 @@ import streamlit as st
 class InvoiceParser:
     def __init__(self, df):
         # Convertimos el dataframe a una matriz de cadenas para facilitar la búsqueda
-        # fillna('') asegura que no fallen las comparaciones de texto
+        # Aseguramos que todo sea texto para evitar errores con floats
         self.df = df.astype(str).replace('nan', '')
-        self.raw_data = self.df.values # CORREGIDO: Usamos self.df (texto) en lugar de df (original mixto)
+        self.raw_data = self.df.values 
 
     def _find_coordinates(self, keywords):
-        """
-        Busca las coordenadas (fila, columna) de la primera celda 
-        que contenga alguna de las palabras clave.
-        """
+        """Busca las coordenadas (fila, columna) de una palabra clave."""
         if isinstance(keywords, str):
             keywords = [keywords]
-        
         keywords = [k.upper() for k in keywords]
         
         for r_idx, row in enumerate(self.raw_data):
             for c_idx, cell in enumerate(row):
                 cell_str = str(cell).upper().strip()
-                # Coincidencia exacta o parcial segura
                 if any(k == cell_str or f" {k} " in f" {cell_str} " for k in keywords):
                     return r_idx, c_idx
         return None, None
 
-    def _get_value_relative(self, anchor_keywords, row_offset=1, col_offset=0):
-        """Busca un ancla y devuelve el valor en la posición relativa indicada."""
-        r, c = self._find_coordinates(anchor_keywords)
-        if r is not None:
+    def _scan_neighborhood(self, r, c, direction='down', max_steps=5):
+        """
+        Escanea celdas vecinas (abajo o derecha) saltando vacíos hasta encontrar un valor.
+        """
+        if r is None or c is None:
+            return "N/A"
+            
+        for i in range(1, max_steps + 1):
             try:
-                # Verificamos límites
-                target_r, target_c = r + row_offset, c + col_offset
-                if target_r < len(self.raw_data) and target_c < len(self.raw_data[0]):
-                    val = self.raw_data[target_r][target_c]
-                    # Aseguramos conversión a string por seguridad extra
-                    return str(val).strip() if val else "N/A"
+                if direction == 'down':
+                    target_r, target_c = r + i, c
+                elif direction == 'right':
+                    target_r, target_c = r, c + i
+                else:
+                    return "N/A"
+
+                # Verificar límites
+                if target_r >= len(self.raw_data) or target_c >= len(self.raw_data[0]):
+                    continue
+
+                val = str(self.raw_data[target_r][target_c]).strip()
+                # Si encontramos algo que no sea vacío, lo devolvemos
+                if val: 
+                    return val
             except IndexError:
                 pass
         return "N/A"
 
     def extract_date(self):
-        """Lógica unificada para FECHA (Día, Mes, Año)."""
-        day = self._get_value_relative(["DIA", "DIA / DAY"])
-        month = self._get_value_relative(["MES", "MES / MONTH"])
-        year = self._get_value_relative(["AÑO", "AÑO / YEAR", "YEAR"])
+        """Extrae y formatea la fecha a formato DD/MM/AAAA."""
+        # Buscamos valores saltando posibles celdas vacías debajo de los headers
+        r_d, c_d = self._find_coordinates(["DIA", "DIA / DAY"])
+        day = self._scan_neighborhood(r_d, c_d, direction='down')
+        
+        r_m, c_m = self._find_coordinates(["MES", "MES / MONTH"])
+        month = self._scan_neighborhood(r_m, c_m, direction='down')
+        
+        r_y, c_y = self._find_coordinates(["AÑO", "AÑO / YEAR", "YEAR"])
+        year = self._scan_neighborhood(r_y, c_y, direction='down')
         
         if "N/A" in [day, month, year]:
-            return "N/A"
+            # Intento alternativo: Buscar "FECHA" y tomar el valor completo
+            r_f, c_f = self._find_coordinates(["FECHA", "DATE", "FECHA DOCUMENTO"])
+            full_date = self._scan_neighborhood(r_f, c_f, direction='down')
+            return full_date if full_date != "N/A" else "N/A"
         
-        # Mapeo simple de meses numéricos si vienen como texto
+        # Mapeo de meses a números para formato estándar
         month_map = {
-            '1': 'Enero', '01': 'Enero', 'JAN': 'Enero',
-            '2': 'Febrero', '02': 'Febrero', 'FEB': 'Febrero',
-            '3': 'Marzo', '03': 'Marzo', 'MAR': 'Marzo',
-            '4': 'Abril', '04': 'Abril', 'APR': 'Abril',
-            '5': 'Mayo', '05': 'Mayo', 'MAY': 'Mayo',
-            '6': 'Junio', '06': 'Junio', 'JUN': 'Junio',
-            '7': 'Julio', '07': 'Julio', 'JUL': 'Julio',
-            '8': 'Agosto', '08': 'Agosto', 'AUG': 'Agosto',
-            '9': 'Septiembre', '09': 'Septiembre', 'SEP': 'Septiembre',
-            '10': 'Octubre', 'OCT': 'Octubre',
-            '11': 'Noviembre', 'NOV': 'Noviembre',
-            '12': 'Diciembre', 'DEC': 'Diciembre'
+            'JANUARY': '01', 'JAN': '01', 'ENERO': '01', 'ENE': '01', '1': '01', '01': '01',
+            'FEBRUARY': '02', 'FEB': '02', 'FEBRERO': '02', '2': '02', '02': '02',
+            'MARCH': '03', 'MAR': '03', 'MARZO': '03', '3': '03', '03': '03',
+            'APRIL': '04', 'APR': '04', 'ABRIL': '04', 'ABR': '04', '4': '04', '04': '04',
+            'MAY': '05', 'MAYO': '05', '5': '05', '05': '05',
+            'JUNE': '06', 'JUN': '06', 'JUNIO': '06', '6': '06', '06': '06',
+            'JULY': '07', 'JUL': '07', 'JULIO': '07', '7': '07', '07': '07',
+            'AUGUST': '08', 'AUG': '08', 'AGOSTO': '08', 'AGO': '08', '8': '08', '08': '08',
+            'SEPTEMBER': '09', 'SEP': '09', 'SEPTIEMBRE': '09', 'SEPT': '09', '9': '09', '09': '09',
+            'OCTOBER': '10', 'OCT': '10', 'OCTUBRE': '10', '10': '10',
+            'NOVEMBER': '11', 'NOV': '11', 'NOVIEMBRE': '11', '11': '11',
+            'DECEMBER': '12', 'DEC': '12', 'DICIEMBRE': '12', 'DIC': '12', '12': '12'
         }
         
-        month_norm = month_map.get(month.upper(), month)
-        return f"{day} de {month_norm} de {year}"
+        m_num = month_map.get(month.upper(), month)
+        # Asegurar ceros a la izquierda para día
+        d_num = day.zfill(2) if day.isdigit() else day
+        
+        return f"{d_num}/{m_num}/{year}"
 
-    def extract_sales_condition(self):
-        """Divide la condición de venta en Tipo e Incoterm."""
-        raw_cond = self._get_value_relative(["CONDICION VENTA", "CONDICION DE VENTA"])
-        
-        if raw_cond == "N/A":
-            return "N/A", "N/A"
+    def extract_currency(self):
+        """Busca la moneda cerca de 'TOTAL FOB' o etiquetas similares, escaneando a la derecha."""
+        # Estrategia 1: Buscar etiqueta "MONEDA"
+        r, c = self._find_coordinates(["MONEDA", "CURRENCY"])
+        if r is not None:
+            val = self._scan_neighborhood(r, c, direction='down') # A veces está abajo
+            if val == "N/A": 
+                val = self._scan_neighborhood(r, c, direction='right') # A veces a la derecha
+            if val != "N/A": return val
+
+        # Estrategia 2: Buscar al lado de "TOTAL FOB" o "TOTAL" (derecha)
+        r, c = self._find_coordinates(["TOTAL FOB", "TOTAL VALUE"])
+        if r is not None:
+            # Escanear hasta 5 celdas a la derecha buscando texto (USD, EUR, DÓLAR)
+            val = self._scan_neighborhood(r, c, direction='right', max_steps=8)
+            return val
             
-        # Separar por guiones, guiones largos o espacios grandes
-        parts = re.split(r'\s*[-–]\s*', raw_cond)
-        
-        tipo_venta = parts[0].strip() if len(parts) > 0 else "N/A"
-        incoterm = parts[1].strip() if len(parts) > 1 else "N/A"
-        
-        return tipo_venta, incoterm
+        return "N/A"
 
     def extract_products_table(self):
         """
-        Identifica la tabla de productos buscando 'CANTIDAD' y 'DESCRIPCION'.
-        Extrae filas hasta encontrar un vacío o totales.
+        Extrae productos con tolerancia a filas vacías intermedias.
         """
-        r_qty, c_qty = self._find_coordinates(["CANTIDAD", "QTY"])
-        r_desc, c_desc = self._find_coordinates(["DESCRIPCION", "DESCRIPTION"])
-        r_price, c_price = self._find_coordinates(["PRECIO UNIT", "UNIT PRICE"])
+        r_qty, c_qty = self._find_coordinates(["CANTIDAD", "QTY", "QUANTITY"])
+        r_desc, c_desc = self._find_coordinates(["DESCRIPCION", "DESCRIPTION", "MERCHANDISE DESCRIPTION"])
+        r_price, c_price = self._find_coordinates(["PRECIO UNIT", "UNIT PRICE", "PRECIO"])
         r_total, c_total = self._find_coordinates(["TOTAL", "TOTAL LINEA"])
 
         if r_desc is None:
             return []
 
         products = []
-        # Asumimos que los datos empiezan en la fila siguiente al encabezado encontrado
-        current_r = max(r for r in [r_qty, r_desc] if r is not None) + 1
+        # Empezamos una fila debajo del encabezado más "profundo" encontrado
+        start_r = max(r for r in [r_qty, r_desc, r_price] if r is not None) + 1
         
+        empty_rows_patience = 0 # Contador para tolerar filas vacías
+        max_patience = 3 # Permitir hasta 3 filas vacías antes de cortar
+        
+        current_r = start_r
         while current_r < len(self.raw_data):
-            # Obtener descripción como pivote para saber si la fila es válida
-            desc_val = self.raw_data[current_r][c_desc] if c_desc is not None else ""
+            desc_val = str(self.raw_data[current_r][c_desc]).strip() if c_desc is not None else ""
             
-            # Condición de parada: Fila vacía o palabra clave de cierre (como 'TOTAL FOB')
-            if not desc_val.strip() or "TOTAL" in desc_val.upper() or "OBSERVACIONES" in desc_val.upper():
+            # Chequeos de parada
+            is_stop_word = any(x in desc_val.upper() for x in ["TOTAL", "OBSERVACIONES", "NOTES", "SUBTOTAL"])
+            
+            if not desc_val:
+                # Si la celda de descripción está vacía, aumentamos paciencia
+                empty_rows_patience += 1
+                if empty_rows_patience > max_patience:
+                    break # Se acabaron las filas de datos
+            elif is_stop_word:
                 break
+            else:
+                # Encontramos datos, reiniciamos paciencia
+                empty_rows_patience = 0
                 
-            qty_val = self.raw_data[current_r][c_qty] if c_qty is not None else "0"
-            price_val = self.raw_data[current_r][c_price] if c_price is not None else "0"
-            total_val = self.raw_data[current_r][c_total] if c_total is not None else "0"
+                qty_val = self.raw_data[current_r][c_qty] if c_qty is not None else "0"
+                price_val = self.raw_data[current_r][c_price] if c_price is not None else "0"
+                total_val = self.raw_data[current_r][c_total] if c_total is not None else "0"
+                
+                # Limpieza básica de NaN en celdas numéricas
+                qty_val = "" if qty_val == "nan" else qty_val
+                price_val = "" if price_val == "nan" else price_val
+                total_val = "" if total_val == "nan" else total_val
+
+                products.append({
+                    "CANTIDAD": qty_val,
+                    "DESCRIPCION": desc_val,
+                    "PRECIO UNITARIO": price_val,
+                    "TOTAL LINEA": total_val
+                })
             
-            products.append({
-                "CANTIDAD": qty_val,
-                "DESCRIPCION": desc_val,
-                "PRECIO UNITARIO": price_val,
-                "TOTAL LINEA": total_val
-            })
             current_r += 1
             
         return products
+    
+    def extract_observations(self):
+        """Busca observaciones al final del documento."""
+        r, c = self._find_coordinates(["OBSERVACIONES", "OBSERVATIONS", "NOTES", "COMENTARIOS"])
+        if r is not None:
+            # Intentar leer abajo
+            val = self._scan_neighborhood(r, c, direction='down', max_steps=2)
+            if val != "N/A": return val
+            # Intentar leer a la derecha
+            val = self._scan_neighborhood(r, c, direction='right', max_steps=5)
+            return val
+        return ""
 
     def process(self):
-        """Ejecuta todo el flujo y devuelve una lista de diccionarios (flat table)."""
+        # 1. Extracción de Cabecera usando Neighborhood Scan
+        r_cli, c_cli = self._find_coordinates(["CLIENTE", "CUSTOMER"])
+        cliente = self._scan_neighborhood(r_cli, c_cli, direction='down')
         
-        # 1. Extracción de Cabecera
-        cliente = self._get_value_relative(["CLIENTE", "CLIENTE / CUSTOMER", "CUSTOMER"])
-        exp = self._get_value_relative(["EXP", "EXP N°", "REF EXP"])
+        r_exp, c_exp = self._find_coordinates(["EXP", "EXP N°", "REF EXP"])
+        exp = self._scan_neighborhood(r_exp, c_exp, direction='down')
+        
         fecha_unificada = self.extract_date()
         
-        tipo_venta, incoterm = self.extract_sales_condition()
-        
-        puerto_emb = self._get_value_relative(["PUERTO EMBARQUE", "PORT OF LOADING"])
-        puerto_dest = self._get_value_relative(["PUERTO DESTINO", "PORT OF DESTINATION"])
-        
-        moneda = self._get_value_relative(["MONEDA", "CURRENCY"])
-        if moneda == "N/A": 
-            # Intento secundario: buscar al lado de TOTAL FOB
-            moneda = self._get_value_relative(["TOTAL FOB"], col_offset=1)
+        # Condición de Venta
+        r_cond, c_cond = self._find_coordinates(["CONDICION VENTA", "CONDICION DE VENTA", "TERMS OF SALE"])
+        raw_cond = self._scan_neighborhood(r_cond, c_cond, direction='down')
+        if raw_cond != "N/A":
+            parts = re.split(r'\s*[-–]\s*', raw_cond)
+            tipo_venta = parts[0].strip() if len(parts) > 0 else "N/A"
+            incoterm = parts[1].strip() if len(parts) > 1 else "N/A"
+        else:
+            tipo_venta, incoterm = "N/A", "N/A"
 
-        # 2. Extracción de Productos (Líneas)
+        # Puertos
+        r_pe, c_pe = self._find_coordinates(["PUERTO EMBARQUE", "PORT OF LOADING"])
+        puerto_emb = self._scan_neighborhood(r_pe, c_pe, direction='down')
+        
+        r_pd, c_pd = self._find_coordinates(["PUERTO DESTINO", "PORT OF DESTINATION", "DISCHARGING PORT"])
+        puerto_dest = self._scan_neighborhood(r_pd, c_pd, direction='down')
+        
+        moneda = self.extract_currency()
+        observaciones = self.extract_observations()
+
+        # 2. Extracción de Productos
         products = self.extract_products_table()
         
-        # 3. Construcción de filas planas (Flat Table)
+        # 3. Construcción Flat Table
         output_rows = []
-        
-        # Datos comunes para todas las filas
         header_data = {
             "CLIENTE": cliente,
             "EXP": exp,
@@ -160,11 +224,11 @@ class InvoiceParser:
             "INCOTERM": incoterm,
             "PUERTO EMBARQUE": puerto_emb,
             "PUERTO DESTINO": puerto_dest,
-            "MONEDA": moneda
+            "MONEDA": moneda,
+            "OBSERVACIONES": observaciones
         }
         
         if not products:
-            # Si no hay productos, devolvemos al menos la cabecera
             row = header_data.copy()
             row.update({"CANTIDAD": "", "DESCRIPCION": "", "PRECIO UNITARIO": "", "TOTAL LINEA": ""})
             output_rows.append(row)
@@ -177,100 +241,43 @@ class InvoiceParser:
         return pd.DataFrame(output_rows)
 
 # ==========================================
-# INTERFAZ DE USUARIO STREAMLIT
+# INTERFAZ DE USUARIO STREAMLIT (Igual que antes)
 # ==========================================
 def main():
     st.set_page_config(page_title="Extractor de Facturas", page_icon="📄", layout="wide")
     
-    st.title("🤖 Extractor Inteligente de Facturas de Exportación")
+    st.title("🤖 Extractor Inteligente de Facturas (V2.0)")
     st.markdown("""
-    Esta herramienta extrae datos de facturas Excel basándose en **etiquetas de texto (anchors)**, 
-    ignorando colores o posiciones fijas. Ideal para formatos desordenados.
-    
-    **Datos que extrae:** Cliente, Fechas, Incoterms, Puertos y Tablas de Productos.
+    **Mejoras V2.0:** Detección de filas vacías en tablas, búsqueda de moneda en celdas lejanas y formateo automático de fechas.
     """)
 
-    # Carga de archivos múltiple
-    uploaded_files = st.file_uploader(
-        "Arrastra y suelta tus facturas Excel aquí (uno o varios)", 
-        type=['xlsx', 'xls'], 
-        accept_multiple_files=True
-    )
+    uploaded_files = st.file_uploader("Sube tus archivos Excel", type=['xlsx', 'xls'], accept_multiple_files=True)
 
     if uploaded_files:
         all_data = []
         progress_bar = st.progress(0)
-        status_text = st.empty()
-
+        
         for i, file in enumerate(uploaded_files):
             try:
-                status_text.text(f"Procesando archivo: {file.name}...")
-                
-                # Leemos el archivo (sin header para usar coordenadas puras)
                 df_raw = pd.read_excel(file, header=None)
-                
-                # Instanciamos la lógica de extracción
                 parser = InvoiceParser(df_raw)
                 df_result = parser.process()
-                
-                # Añadimos el nombre del archivo para trazabilidad
                 df_result.insert(0, "ARCHIVO_ORIGEN", file.name)
-                
                 all_data.append(df_result)
-                
             except Exception as e:
-                st.error(f"❌ Error al procesar {file.name}: {str(e)}")
-            
-            # Actualizar barra de progreso
+                st.error(f"❌ Error en {file.name}: {str(e)}")
             progress_bar.progress((i + 1) / len(uploaded_files))
 
-        status_text.text("¡Procesamiento completado!")
-        
         if all_data:
-            # Consolidar todo en un solo DataFrame
             final_df = pd.concat(all_data, ignore_index=True)
-            
-            st.success(f"✅ Se han extraído {len(final_df)} líneas de productos de {len(uploaded_files)} facturas.")
-            
-            # Mostrar vista previa
-            st.subheader("Vista Previa de Resultados")
+            st.success("✅ Procesamiento completado")
             st.dataframe(final_df, use_container_width=True)
             
-            # Botón de descarga
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                final_df.to_excel(writer, index=False, sheet_name='Consolidado')
+                final_df.to_excel(writer, index=False)
             
-            st.download_button(
-                label="📥 Descargar Excel Consolidado",
-                data=output.getvalue(),
-                file_name="reporte_facturas_exportacion.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-    else:
-        st.info("👆 Sube tus archivos Excel para comenzar.")
-        
-        # Opción para descargar plantilla de prueba (opcional)
-        st.divider()
-        st.caption("¿No tienes un archivo a mano? Genera uno de prueba:")
-        if st.button("Generar Factura de Prueba (Mock)"):
-            # Lógica simple para generar el mock al vuelo solo si se pide
-            mock_data = [
-                ["", "FACTURA DE EXPORTACIÓN", "", "", "", "", ""],
-                ["", "CLIENTE / CUSTOMER", "", "EXP", "", "FECHA", ""],
-                ["", "EJEMPLO CORP S.A.", "", "REF-999", "", "01/JAN/2025", ""],
-                ["", "CONDICION VENTA", "", "PUERTO DESTINO", "", "MONEDA", ""],
-                ["", "A FIRME - CIF - ROTTERDAM", "", "ROTTERDAM", "", "USD", ""],
-                ["", "DESCRIPCION", "CANTIDAD", "PRECIO UNIT", "TOTAL", "", ""],
-                ["", "CAJAS DE ARÁNDANOS", "1000", "15.00", "15000.00", "", ""],
-                ["", "CAJAS DE CEREZAS", "500", "20.00", "10000.00", "", ""]
-            ]
-            df_mock = pd.DataFrame(mock_data)
-            buffer = io.BytesIO()
-            with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                df_mock.to_excel(writer, index=False, header=False)
-            
-            st.download_button("Descargar Mock.xlsx", buffer.getvalue(), "mock_factura.xlsx")
+            st.download_button("📥 Descargar Reporte", output.getvalue(), "reporte_exportacion.xlsx")
 
 if __name__ == "__main__":
     main()
