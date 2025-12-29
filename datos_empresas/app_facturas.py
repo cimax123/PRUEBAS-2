@@ -170,7 +170,17 @@ class InvoiceParser:
         return products
     
     def extract_observations(self):
-        """Busca observaciones al final del documento."""
+        """Busca observaciones bajo 'Country of Origin' o etiquetas estándar."""
+        
+        # Estrategia 1: Prioridad solicitada - Buscar debajo de "COUNTRY OF ORIGIN"
+        # Buscamos coincidencias flexibles
+        r, c = self._find_coordinates(["COUNTRY OF ORIGIN", "COUNTRY OF ORIGIN: CHILE", "ORIGIN: CHILE"])
+        if r is not None:
+            # Escaneamos hacia abajo buscando el primer texto no vacío
+            val = self._scan_neighborhood(r, c, direction='down', max_steps=5)
+            if val != "N/A": return val
+
+        # Estrategia 2: Buscar por etiquetas estándar de observaciones (Fallback)
         r, c = self._find_coordinates(["OBSERVACIONES", "OBSERVATIONS", "NOTES", "COMENTARIOS"])
         if r is not None:
             # Intentar leer abajo
@@ -179,6 +189,7 @@ class InvoiceParser:
             # Intentar leer a la derecha
             val = self._scan_neighborhood(r, c, direction='right', max_steps=5)
             return val
+            
         return ""
 
     def process(self):
