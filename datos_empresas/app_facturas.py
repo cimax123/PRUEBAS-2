@@ -5,7 +5,7 @@ import io
 import re
 import unicodedata
 import zipfile
-from bs4 import BeautifulSoup
+import xml.etree.ElementTree as ET
 
 # --- Funciones de Limpieza y Utilidad ---
 
@@ -55,13 +55,12 @@ def parse_month(text):
     if text.isdigit() and len(text) == 1: return f"0{text}"
     return text if text.isdigit() else None
 
-# --- Lógica Forense (XML Parsing) ---
-# Esta es la alternativa al OCR visual. Lee la estructura interna del Excel.
+# --- Lógica Forense (XML Parsing con Librería Estándar) ---
 
 def extract_text_from_drawings(uploaded_file):
     """
-    Descomprime el XLSX y busca texto dentro de los archivos XML de dibujos (shapes).
-    Retorna una lista de textos encontrados en objetos flotantes.
+    Descomprime el XLSX y busca texto dentro de los archivos XML de dibujos (shapes)
+    usando xml.etree.ElementTree (nativo de Python).
     """
     drawings_text = []
     try:
@@ -72,17 +71,17 @@ def extract_text_from_drawings(uploaded_file):
             for df in drawing_files:
                 with z.open(df) as f:
                     content = f.read()
-                    # Usamos BeautifulSoup para parsear el XML sucio
-                    soup = BeautifulSoup(content, "xml")
-                    # El texto en los shapes suele estar en etiquetas <a:t> (text body)
-                    texts = soup.find_all('t') # a:t a veces se parsea como t
-                    for t in texts:
-                        if t.text:
-                            drawings_text.append(t.text.strip())
-                            
-            # También revisar sharedStrings si es necesario, pero drawings es la clave para TextBoxes
+                    # Parsear XML nativamente
+                    root = ET.fromstring(content)
+                    # Iterar recursivamente sobre todos los elementos
+                    for elem in root.iter():
+                        # El texto en OpenXML suele estar en etiquetas que terminan en 't' (ej: <a:t>)
+                        if elem.tag.endswith('}t'):
+                            if elem.text and elem.text.strip():
+                                drawings_text.append(elem.text.strip())
     except Exception as e:
-        print(f"Error forense: {e}")
+        # Silencioso en caso de error para no romper la app principal
+        print(f"Nota: No se pudo realizar extracción forense completa: {e}")
         return []
     
     return drawings_text
@@ -159,14 +158,15 @@ def get_all_sheet_text(sheet):
 
 def process_file(uploaded_file):
     # 1. Extracción Forense (Drawings/Text Boxes)
-    # IMPORTANTE: Rebobinar el archivo después de leerlo como zip, para que openpyxl pueda leerlo
     forensic_texts = []
     try:
+        # Necesitamos leer el archivo dos veces, una como ZIP y otra como Excel
+        # Guardamos la posición actual
         uploaded_file.seek(0)
         forensic_texts = extract_text_from_drawings(uploaded_file)
-        uploaded_file.seek(0) # Reset pointer
-    except:
-        pass
+        uploaded_file.seek(0) # Reset pointer para openpyxl
+    except Exception as e:
+        print(f"Error en forense: {e}")
 
     try:
         wb = openpyxl.load_workbook(uploaded_file, data_only=True)
@@ -212,7 +212,7 @@ def process_file(uploaded_file):
     for txt in forensic_texts:
         txt_norm = normalize_text(txt)
         if "BAJO CONDICION" in txt_norm or "UNDER CONDITION" in txt_norm or "CONSIGNACION" in txt_norm:
-            condicion_found = txt # ¡Encontrado en un dibujo oculto!
+            condicion_found = txt 
             break
             
     # B) Si no, buscar en celdas normales
@@ -330,10 +330,9 @@ def process_file(uploaded_file):
     
     # 2. Forense: Buscar texto largo en dibujos (Text Boxes)
     if not obs_text and forensic_texts:
-        # Asumimos que la observación es el texto más largo encontrado en los dibujos
         longest_drawing = max(forensic_texts, key=len) if forensic_texts else None
         if longest_drawing and len(longest_drawing) > 20:
-            obs_text = longest_drawing # ¡Encontrado en un Text Box!
+            obs_text = longest_drawing 
 
     # 3. Footer Celdas
     if not obs_text: obs_text = find_longest_text_in_footer(sheet, last_row_table + 1)
@@ -350,9 +349,9 @@ def process_file(uploaded_file):
 
 # --- Interfaz Gráfica ---
 
-st.set_page_config(page_title="Extractor V16 Forense", layout="wide")
-st.title("📄 Extractor V16: Modo Forense (OCR Digital)")
-st.info("Esta versión descomprime el Excel y busca texto oculto en 'Shapes' y Cuadros de Texto sin necesidad de OCR visual.")
+st.set_page_config(page_title="Extractor V17 Forense", layout="wide")
+st.title("📄 Extractor V17: Modo Forense")
+st.info("Versión optimizada que usa librerías estándar de Python para leer datos ocultos en cuadros de texto.")
 
 uploaded_files = st.file_uploader("Archivos Excel (.xlsx)", type=['xlsx'], accept_multiple_files=True)
 
@@ -382,14 +381,14 @@ if uploaded_files:
                 
                 buffer = io.BytesIO()
                 with pd.ExcelWriter(buffer, engine='openpyxl') as writer: df.to_excel(writer, index=False)
-                st.download_button("Descargar Excel", buffer.getvalue(), "facturas_v16.xlsx")
+                st.download_button("Descargar Excel", buffer.getvalue(), "facturas_v17.xlsx")
             else: st.warning("No se extrajeron datos.")
 
         with tab2:
-            st.info("Texto encontrado en Cuadros de Texto (Shapes) ignorados por Excel tradicional:")
+            st.info("Texto encontrado en Cuadros de Texto (Shapes):")
             for fname, texts in forensic_info.items():
                 with st.expander(f"Archivo: {fname}"):
                     if texts:
                         st.write(texts)
                     else:
-                        st.write("No se encontraron cuadros de texto ocultos en este archivo.")
+                        st.write("No se encontraron cuadros de texto ocultos.")
