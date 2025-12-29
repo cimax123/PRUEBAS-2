@@ -10,7 +10,7 @@ class InvoiceParser:
         # Convertimos el dataframe a una matriz de cadenas para facilitar la búsqueda
         # fillna('') asegura que no fallen las comparaciones de texto
         self.df = df.astype(str).replace('nan', '')
-        self.raw_data = df.values # Matriz numpy para acceso rápido por coordenadas
+        self.raw_data = self.df.values # CORREGIDO: Usamos self.df (texto) en lugar de df (original mixto)
 
     def _find_coordinates(self, keywords):
         """
@@ -39,7 +39,8 @@ class InvoiceParser:
                 target_r, target_c = r + row_offset, c + col_offset
                 if target_r < len(self.raw_data) and target_c < len(self.raw_data[0]):
                     val = self.raw_data[target_r][target_c]
-                    return val.strip() if val else "N/A"
+                    # Aseguramos conversión a string por seguridad extra
+                    return str(val).strip() if val else "N/A"
             except IndexError:
                 pass
         return "N/A"
