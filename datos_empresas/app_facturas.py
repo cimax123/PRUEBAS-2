@@ -61,7 +61,7 @@ def parse_month(text):
 
 def find_label_cell(sheet, keywords):
     """
-    Busca la coordenada de una etiqueta en la hoja usando texto normalizado (sin acentos).
+    Busca la coordenada de una etiqueta en la hoja usando texto normalizado.
     """
     keywords_norm = [normalize_text(k) for k in keywords]
     
@@ -94,7 +94,7 @@ def extract_value_near_label(sheet, label_row, label_col, look_down=True, look_r
                 if val_norm:
                     # Filtro: Si parece otra etiqueta, ignorar
                     if "CLIENTE" in val_norm or "FECHA" in val_norm: continue
-                    return val # Devolvemos valor original (con formato)
+                    return val # Devolvemos valor original
             except:
                 pass
     return None
@@ -102,16 +102,19 @@ def extract_value_near_label(sheet, label_row, label_col, look_down=True, look_r
 def scan_headers_footers(sheet):
     """Busca texto en las propiedades de impresión (Header/Footer)."""
     texts = []
-    props = [
-        sheet.oddHeader.left, sheet.oddHeader.center, sheet.oddHeader.right,
-        sheet.oddFooter.left, sheet.oddFooter.center, sheet.oddFooter.right,
-        sheet.evenHeader.left, sheet.evenHeader.center, sheet.evenHeader.right,
-        sheet.evenFooter.left, sheet.evenFooter.center, sheet.evenFooter.right,
-        sheet.firstHeader.left, sheet.firstHeader.center, sheet.firstHeader.right,
-        sheet.firstFooter.left, sheet.firstFooter.center, sheet.firstFooter.right,
-    ]
-    for p in props:
-        if p.text: texts.append(p.text)
+    try:
+        props = [
+            sheet.oddHeader.left, sheet.oddHeader.center, sheet.oddHeader.right,
+            sheet.oddFooter.left, sheet.oddFooter.center, sheet.oddFooter.right,
+            sheet.evenHeader.left, sheet.evenHeader.center, sheet.evenHeader.right,
+            sheet.evenFooter.left, sheet.evenFooter.center, sheet.evenFooter.right,
+            sheet.firstHeader.left, sheet.firstHeader.center, sheet.firstHeader.right,
+            sheet.firstFooter.left, sheet.firstFooter.center, sheet.firstFooter.right,
+        ]
+        for p in props:
+            if p.text: texts.append(p.text)
+    except:
+        pass
     return " | ".join(texts) if texts else None
 
 def find_longest_text_in_footer(sheet, start_row, min_length=20):
@@ -207,25 +210,33 @@ def process_file(uploaded_file):
         else:
             header_data['Fecha'] = None
 
-    # 4. CONDICIÓN DE VENTA
-    # Buscar por etiqueta normalizada
-    lbl_coords = find_label_cell(sheet, ['CONDICION DE VENTA', 'TERMS OF SALE', 'DELIVERY TERMS', 'INCOTERM'])
-    if lbl_coords:
-        header_data['Condicion_Venta'] = extract_value_near_label(sheet, lbl_coords[0], lbl_coords[1], look_down=True, look_right=True)
+    # 4. CONDICIÓN DE VENTA - Lógica V15 (Prioridad Inversa)
+    condicion_found = None
+    
+    # A) PRIORIDAD MÁXIMA: Buscar la frase "BAJO CONDICION" en toda la hoja (Rescue scan)
+    # Esto evita que una etiqueta "Flete: Collect" oculte la verdadera condición
+    for idx, row in debug_df.iterrows():
+        txt = normalize_text(row['Valor'])
+        # Buscamos frases que indiquen inequívocamente la condición especial
+        if "BAJO CONDICION" in txt or "UNDER CONDITION" in txt or "A CONSIGNACION" in txt:
+            condicion_found = row['Valor'] # Usar valor original
+            break
+            
+    if condicion_found:
+        header_data['Condicion_Venta'] = condicion_found
     else:
-        # Intento de rescate V13: Buscar en Headers/Footers si no se encontró
-        hf = scan_headers_footers(sheet)
-        if hf and "CONDICION" in normalize_text(hf):
-            header_data['Condicion_Venta'] = hf # Fallback crudo
+        # B) Si no hay frase mágica, buscar por etiqueta estándar fuerte
+        lbl_coords = find_label_cell(sheet, ['CONDICION DE VENTA', 'TERMS OF SALE', 'DELIVERY TERMS', 'INCOTERM'])
+        if lbl_coords:
+             header_data['Condicion_Venta'] = extract_value_near_label(sheet, lbl_coords[0], lbl_coords[1], look_down=True, look_right=True)
         else:
-            # Rescate ciego: Buscar celda que contenga "BAJO CONDICION"
-            for idx, row in debug_df.iterrows():
-                txt = normalize_text(row['Valor'])
-                if "BAJO CONDICION" in txt or "UNDER CONDITION" in txt:
-                    header_data['Condicion_Venta'] = row['Valor']
-                    break
+            # C) Último recurso: Buscar TIPO FLETE (etiqueta débil)
+            lbl_flete = find_label_cell(sheet, ['TIPO FLETE', 'FREIGHT TYPE'])
+            if lbl_flete:
+                 header_data['Condicion_Venta'] = extract_value_near_label(sheet, lbl_flete[0], lbl_flete[1], look_down=True, look_right=True)
             else:
-                header_data['Condicion_Venta'] = None
+                 header_data['Condicion_Venta'] = None
+
 
     # 5. FORMA DE PAGO
     lbl_coords = find_label_cell(sheet, ['FORMA DE PAGO', 'PAYMENT TERMS'])
@@ -243,16 +254,26 @@ def process_file(uploaded_file):
     incoterm_list = ['FOB', 'CIF', 'CFR', 'EXW', 'FCA']
     currency_map = {'DÓLAR': 'USD', 'DOLAR': 'USD', 'USD': 'USD', 'EURO': 'EUR'}
     
+    # 8. TIPO DE CAMBIO
+    lbl_tc = find_label_cell(sheet, ['TIPO DE CAMBIO', 'TIPO CAMBIO', 'T.C.', 'EXCHANGE RATE'])
+    header_data['Tipo_Cambio'] = extract_value_near_label(sheet, lbl_tc[0], lbl_tc[1]) if lbl_tc else None
+
+    # Escaneo Global de Celdas
     for idx, row in debug_df.iterrows():
-        v = normalize_text(row['Valor'])
+        v_orig = str(row['Valor'])
+        v_norm = normalize_text(v_orig)
+        
+        # Detección de Incoterm (FOB, CIF)
         if not detected_codes['Incoterm']:
             for inc in incoterm_list:
-                # Palabra exacta
-                if re.search(rf"\b{inc}\b", v): detected_codes['Incoterm'] = inc
+                if re.search(rf"\b{inc}\b", v_norm): detected_codes['Incoterm'] = inc
+        
+        # Detección de Moneda (USD, DÓLAR)
         if not detected_codes['Moneda']:
             for cur, code in currency_map.items():
-                if cur in v: detected_codes['Moneda'] = code
-
+                if cur in v_norm: 
+                    detected_codes['Moneda'] = code 
+                    
     header_data['Moneda'] = detected_codes['Moneda']
     header_data['Incoterm'] = detected_codes['Incoterm']
 
@@ -327,10 +348,10 @@ def process_file(uploaded_file):
     else:
         last_row_table = 20
 
-    # --- OBSERVACIONES (Lógica V13) ---
+    # --- OBSERVACIONES ---
     obs_text = None
     
-    # 1. Intentar por etiqueta (Normalizada)
+    # 1. Intentar por etiqueta
     obs_label_pos = find_label_cell(sheet, ['OBSERVACIONES', 'REMARKS', 'NOTAS', 'GLOSA', 'COMENTARIOS'])
     if obs_label_pos:
         obs_text = extract_value_near_label(sheet, obs_label_pos[0], obs_label_pos[1], look_down=True, look_right=True)
@@ -342,7 +363,7 @@ def process_file(uploaded_file):
     # 3. Si falló, revisar Header/Footer de impresión
     if not obs_text:
         hf = scan_headers_footers(sheet)
-        if hf and len(hf) > 20: # Si hay texto largo en header/footer, podría ser la observación
+        if hf and len(hf) > 20: 
              obs_text = hf
 
     header_data['Observaciones'] = obs_text
@@ -359,13 +380,12 @@ def process_file(uploaded_file):
 
 # --- Interfaz Gráfica ---
 
-st.set_page_config(page_title="Extractor V13", layout="wide")
-st.title("📄 Extractor de Facturas V13 (Deep Scan)")
+st.set_page_config(page_title="Extractor V15", layout="wide")
+st.title("📄 Extractor de Facturas V15 (Prioridad Bajo Condición)")
 st.markdown("""
-**Diagnóstico Avanzado:**
-* **Normalización:** Ignora mayúsculas/minúsculas y acentos (Condición = CONDICION).
-* **Scanner Oculto:** Busca en encabezados/pies de página de impresión.
-* **Alerta de Objetos:** Avisa si detecta "Text Boxes" invisibles.
+**Ajustes V15:**
+* **Prioridad Condición de Venta:** Busca primero frases como "BAJO CONDICION". Si las encuentra, ignora "COLLECT".
+* **Depuración:** Detecta texto en encabezados y objetos flotantes.
 """)
 
 uploaded_files = st.file_uploader("Archivos Excel (.xlsx)", type=['xlsx'], accept_multiple_files=True)
@@ -389,8 +409,7 @@ if uploaded_files:
         # Alerta de Cuadros de Texto
         if drawings_alert:
             st.warning(f"⚠️ ¡ATENCIÓN! Se detectaron objetos flotantes (Imágenes/Cuadros de Texto) en: {', '.join(drawings_alert)}. "
-                       "Si faltan las Observaciones, es 99% seguro que están dentro de estos cuadros. "
-                       "Python no puede leer texto dentro de imágenes/formas fácilmente. "
+                       "Si faltan las Observaciones, es probable que estén dentro de estos cuadros. "
                        "**Solución:** Copia el texto del cuadro y pégalo en una celda vacía del Excel.")
 
         tab1, tab2 = st.tabs(["📊 Resultados", "🔍 Diagnóstico Total"])
@@ -399,7 +418,7 @@ if uploaded_files:
             if all_data:
                 df = pd.DataFrame(all_data)
                 cols_order = ['Archivo', 'Cliente', 'Num_Exp', 'Fecha', 'Condicion_Venta', 'Incoterm', 'Forma_Pago', 
-                              'Moneda', 'Puerto_Emb', 'Puerto_Dest', 'Cantidad', 'Descripcion', 
+                              'Moneda', 'Tipo_Cambio', 'Puerto_Emb', 'Puerto_Dest', 'Cantidad', 'Descripcion', 
                               'Precio Unitario', 'Total Linea', 'Observaciones']
                 final_cols = [c for c in cols_order if c in df.columns] + [c for c in df.columns if c not in cols_order]
                 df = df[final_cols]
@@ -409,12 +428,12 @@ if uploaded_files:
                 buffer = io.BytesIO()
                 with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
                     df.to_excel(writer, index=False)
-                st.download_button("Descargar Excel", buffer.getvalue(), "facturas_v13.xlsx")
+                st.download_button("Descargar Excel", buffer.getvalue(), "facturas_v15.xlsx")
             else:
                 st.warning("No se extrajeron datos.")
 
         with tab2:
-            st.info("Este es el texto REAL que el robot puede ver en las celdas. Si tus datos no están aquí, están en cuadros de texto flotantes.")
+            st.info("Texto crudo visto por el sistema:")
             for fname, d_df in debug_info.items():
                 with st.expander(f"Rayos X de: {fname}"):
                     st.dataframe(d_df, use_container_width=True)
